@@ -10,10 +10,17 @@ A bash shell script is included to simplify the build process. It assumes you ar
 
 The script will attempt to build both 32 bit and 64 bit executables. If you do not want to build both or do not have the libraries for both then you can use the first gcc command in the script to compile for your system.
 
+Building is as simple as the following command...
+    sh xgravity-build.sh
+
+
 Command line arguments
 --------------
 
 xgravity will accept two arguments, the number of planets to work with and the number of threads to use for the calculations.
+
+Running xgravity with 500 planets and 2 threads would require the following command...
+    ./xgravity 500 2
 
 
 X Interface
