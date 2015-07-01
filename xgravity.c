@@ -129,7 +129,7 @@ void * calcWorker(void * args);
 double massMax, massMin; // planet mass extremes
 planet planets[MAXCOUNT]; // array of planet structs
 
-double pival, halfpi, twopi, sqrtpi; // calculated pi values
+double pival, halfpi, twopival, sqrtpi; // calculated pi values
 double sphereradc; // calculated constant for sphere radius formula
 int count; // how many planets we can have
 int threads; // number of calculation threads to run
@@ -185,7 +185,7 @@ main(int argc, char *argv[]) {
   pival = 4.0 * atan(1.0); /* get pi without having to type in 16 digits */
   sphereradc = (4 / 3 * pival) * 5000000000; // multiplied by constant for dirty density calc
   halfpi = pival / 2;
-  twopi = 2 * pival;
+  twopival = 2 * pival;
   sqrtpi = sqrt(pival);
   
   // set thread counts to defaults
@@ -917,7 +917,7 @@ void randomizePlanets()
   for(i = 0; i < count; i++) {
     // randomize polar coordinates from center
     r = MAXPOS * (rand() / (RAND_MAX + 1.0));
-    a = twopi * (rand() / (RAND_MAX + 1.0));
+    a = twopival * (rand() / (RAND_MAX + 1.0));
     
     // convert polar coordinates into rectangular
     planets[i].x = (r * cos(a));
