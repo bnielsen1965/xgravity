@@ -72,7 +72,7 @@ For more information, please refer to <http://unlicense.org/>
 
 // default number of threads to use for calculations and the maximum
 #define THREAD_COUNT 4
-#define MAX_THREADS 8
+#define MAX_THREADS 1000
 
 
 /**
@@ -136,8 +136,8 @@ int threads; // number of calculation threads to run
 
 // thread variables
 pthread_barrier_t calcBarrier;
-pthread_t calcThreads[THREAD_COUNT];
-pthread_mutex_t calcMutex;
+pthread_t calcThreads[MAX_THREADS];
+pthread_mutex_t calcMutex = PTHREAD_MUTEX_INITIALIZER;
 
 
 /**
