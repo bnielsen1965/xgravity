@@ -40,104 +40,7 @@ For more information, please refer to <http://unlicense.org/>
 #include <string.h>
 #include <float.h>
 #include <pthread.h> 
-
-
-/**
- * Constants
- */
-
-// default number of planets and maximum allowed count
-#define COUNT 500
-#define MAXCOUNT 100000
-
-// terminal window size
-#define WINW 1024
-#define WINH 768
-
-// max distance from display center when randomizing planets
-#define MAXPOS 5000
-
-// maximum mass in kg when randomizing
-#define MAXKG 1e12
-
-// maximum speed when randomizing
-#define MAXV 9e-1
-
-// pixel dimension settings when drawing planets
-#define MAX_PIXEL_RADIUS 40
-#define MIN_PIXEL_RADIUS 8
-
-// gravitational constant
-#define G 6.67428e-11
-
-// default number of threads to use for calculations and the maximum
-#define THREAD_COUNT 4
-#define MAX_THREADS 1000
-
-
-/**
- * Special types
- */
-
-// rectangular vector for planets acceleration
-typedef struct
-{
-  // rectangular vector
-  double accelerationX;
-  double accelerationY;
-} accelerationVector;
-
-// structure used to define each planet
-typedef struct
-{
-  double x, y; // 2d position
-  double mass; // mass
-  double velocityX; // velocity in x direction
-  double velocityY; // velocity in y direction
-  accelerationVector acceleration; // gravitational acceleration
-  double nearestDistance; // used to decide if this planet needs collision detection
-  int flash; // flash state
-  int calc; // calculation state
-  
-  // temporary variables used when running calculations
-  double calcDistance;
-  double calcGravity;
-  double calcDirection;
-  double calcAccelerationX;
-  double calcAccelerationY;
-} planet;
-
-
-/**
- * declare functions
- */
-
-void randomizePlanets();
-void calculateDistance(int p1, int p2);
-void calculateGravitationalForce(int p1, int p2);
-void calculateGravitationalDirection(int p1, int p2);
-void addGravitationalAcceleration(int p1, int p2);
-int inCollisionRange(double mass1, double mass2, double distance);
-void calculateCollisions();
-void * calcWorker(void * args);
-
-
-/**
- * globals
- */
-
-double massMax, massMin; // planet mass extremes
-planet planets[MAXCOUNT]; // array of planet structs
-
-double pival, halfpi, twopival, sqrtpi; // calculated pi values
-double sphereradc; // calculated constant for sphere radius formula
-int count; // how many planets we can have
-int threads; // number of calculation threads to run
-
-// thread variables
-pthread_barrier_t calcBarrier;
-pthread_t calcThreads[MAX_THREADS];
-pthread_mutex_t calcMutex = PTHREAD_MUTEX_INITIALIZER;
+#include "xgravity.h"
 
 
 /**
@@ -149,23 +52,29 @@ pthread_mutex_t calcMutex = PTHREAD_MUTEX_INITIALIZER;
  * @param argc
  * @param argv
  */
-main(int argc, char *argv[]) {
-
-  double minx, maxx, miny, maxy, cx, cy;
-  int pi; // planet iterator
+int main(int argc, char *argv[]) {
+  
+  pthread_t calcThreads[MAX_THREADS];
+  pthread_barrier_t calcBarrier;
+  pthread_mutex_t calcMutex = PTHREAD_MUTEX_INITIALIZER;
+  calcArgs calcThreadArgs;
+  int threads; // number of calculation threads to run
+  
+  planet *planets[MAXCOUNT];
+  planet *aPlanet;
+  
+  double minx, maxx, miny, maxy, cx, cy, massMax, massMin, timeFactor, forceMultiplier, radiusScale;
+  int pi, count; // planet iterator
   long int zoomFactor; // zoom factor
-  double timeFactor; // time factor
-  double forceMultiplier; // force multiplier used when drawing force lines
   int centerID; // id of object to use for auto centering
-  double radiusScale; // scaling of drawing radius
   int radius; // radius in pixels
-
-  int winw, winh; // window dimensions
 
   double fg, td, dist; // temporary accelerating force and direction
   
   int shownum; // show stat numbers flag
   int showforce; // show force lines flag
+
+  int winw, winh; // window dimensions
 
   Display *display;
   int screen;
@@ -181,22 +90,15 @@ main(int argc, char *argv[]) {
   XFontStruct *font_info;
   GContext gid;
 
-  // calculate pi values
-  pival = 4.0 * atan(1.0); /* get pi without having to type in 16 digits */
-  sphereradc = (4 / 3 * pival) * 5000000000; // multiplied by constant for dirty density calc
-  halfpi = pival / 2;
-  twopival = 2 * pival;
-  sqrtpi = sqrt(pival);
-  
-  // set thread counts to defaults
-  count = COUNT;
-  threads = THREAD_COUNT;
   
   // check for planet count in arguments
   if( argc > 1 ) {
     // first argument is planet count
     count = atoi(argv[1]);
     if( count > MAXCOUNT ) count = MAXCOUNT;
+  }
+  else {
+    count = COUNT;
   }
   
   // check for thread count in arguments
@@ -211,6 +113,9 @@ main(int argc, char *argv[]) {
     {
       threads = MAX_THREADS;
     }
+  }
+  else {
+    threads = THREAD_COUNT;
   }
 
   // set default control values
@@ -257,18 +162,6 @@ main(int argc, char *argv[]) {
   colormap = DefaultColormap(display, 0);
   gc = XCreateGC(display, pixmap, 0, 0);
 
-  // define color names
-  #define COLOR_GREEN 0
-  #define COLOR_BLUE 1
-  #define COLOR_RED 2
-  #define COLOR_WHITE 3
-  #define COLOR_BLACK 4
-  #define COLOR_STAR 5
-  #define COLOR_BACKGROUND 6
-  #define COLOR_FLASH 7
-
-  #define COLOR_COUNT 8
-  
   // define color codes
   char *colorCodes[] = {
     "#009900",
@@ -289,7 +182,6 @@ main(int argc, char *argv[]) {
     XAllocColor(display, colormap, &drawColors[pi]);
   }
   
-  
   gid = XGContextFromGC(gc);
   font_info = XQueryFont(display, gid);
 
@@ -298,18 +190,30 @@ main(int argc, char *argv[]) {
   XCopyArea(display, pixmap, window, gc, 0, 0, winw, winh, 0, 0);
   XFlush(display);
 
+  
+  // allocate memory for planet data
+  for ( pi = 0; pi < count; pi++ ) {
+    planets[pi] = (planet *) malloc(sizeof(planet));
+  }
+  
+  // initialize planets
+  randomizePlanets(planets, count);
+
   // initialize the thread barrier to thread count plus main
   pthread_barrier_init(&calcBarrier, NULL, threads + 1);
+
+  // collect thread arguments into struct
+  calcThreadArgs.planetData = planets;
+  calcThreadArgs.count = count;
+  calcThreadArgs.calcBarrier = &calcBarrier;
+  calcThreadArgs.calcMutex = &calcMutex;
   
   // initialize threads
   for(pi = 0; pi < threads; pi++)
   {
-    pthread_create(&calcThreads[pi], NULL, &calcWorker, NULL);
+    pthread_create(&calcThreads[pi], NULL, &calcWorker, &calcThreadArgs);
   }
   
-  // initialize planets
-  randomizePlanets();
-
   // main application loop
   while(1) {
 
@@ -373,11 +277,11 @@ main(int argc, char *argv[]) {
         
         // use planets to find minimum and maximum position values for zoom window
         for(pi = 0; pi < count; pi++) {
-          if( planets[pi].mass > 0 ) {
-            if( planets[pi].x < minx ) minx = planets[pi].x - 500;
-            if( planets[pi].x > maxx ) maxx = planets[pi].x + 500;
-            if( planets[pi].y < miny ) miny = planets[pi].y - 500;
-            if( planets[pi].y > maxy ) maxy = planets[pi].y + 500;
+          if( planets[pi]->mass > 0 ) {
+            if( planets[pi]->x < minx ) minx = planets[pi]->x - 500;
+            if( planets[pi]->x > maxx ) maxx = planets[pi]->x + 500;
+            if( planets[pi]->y < miny ) miny = planets[pi]->y - 500;
+            if( planets[pi]->y > maxy ) maxy = planets[pi]->y + 500;
           }
         }
         
@@ -395,255 +299,45 @@ main(int argc, char *argv[]) {
       
       // re-randomize planets
       else if( text[0] == 'r' ) {
-        randomizePlanets();
+        randomizePlanets(planets, count);
       }
       
       // wipe all planets
       else if( text[0] == 'w' ) {
         massMax = 0;
         massMin = DBL_MAX;
-
-        for(pi = 0; pi < count; pi++) {
-          planets[pi].x = 0;
-          planets[pi].y = 0;
-          planets[pi].velocityX = 0;
-          planets[pi].velocityY = 0;
-          planets[pi].mass = 0;
-        }
+        clearPlanets(planets, count);
       }
       
       else if( text[0] == 's' ) {
-        // create a massive gravitation well :)
-        pi = count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = 0 - cy;
-        planets[pi].mass = MAXKG * (int)(1000 * (rand() / (RAND_MAX + 1.0)));
-        planets[pi].velocityX = 0;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
+        // create a gravitation well
+        createGravityWell(planets, count, cx, cy);
       }
       
       else if( text[0] == 'b' ) {
-        // create a binary massive gravitation well :)
-        pi = count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = 500 - cy;
-        planets[pi].mass = MAXKG * (int)(1000 * (rand() / (RAND_MAX + 1.0)));
-        planets[pi].velocityX = 2;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        pi = count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = -500 - cy;
-        planets[pi].mass = MAXKG * (int)(1000 * (rand() / (RAND_MAX + 1.0)));
-        planets[pi].velocityX = -2;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
+        // create a binary gravitation well
+        createBinaryWell(planets, count, cx, cy);
       }
       
       else if( text[0] == 'h' ) {
-        // create a binary massive gravitation well :)
-        pi = count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = 0 - cy;
-        planets[pi].mass = 2e14;
-        planets[pi].velocityX = 0;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        pi = count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = -200 - cy;
-        planets[pi].mass = 5e8;
-        planets[pi].velocityX = -8;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        pi = count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = -500 - cx;
-        planets[pi].y = 0 - cy;
-        planets[pi].mass = 5e8;
-        planets[pi].velocityX = 0;
-        planets[pi].velocityY = 5;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        pi = count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 800 - cx;
-        planets[pi].y = 0 - cy;
-        planets[pi].mass = 5e8;
-        planets[pi].velocityX = 0;
-        planets[pi].velocityY = -4.5;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        pi = count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = 1200 - cy;
-        planets[pi].mass = 5e8;
-        planets[pi].velocityX = 3.8;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
+        // create a heliocentric system
+        createHeliocentricSystem(planets, count, cx, cy);
       }
       
       else if( text[0] == 'g' ) {
-        // create a binary massive gravitation well :)
-        pi = count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = 0 - cy;
-        planets[pi].mass = 5e8;
-        planets[pi].velocityX = 0;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        pi = count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = -200 - cy;
-        planets[pi].mass = 5e8;
-        planets[pi].velocityX = -8;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        pi = count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = -500 - cx;
-        planets[pi].y = 0 - cy;
-        planets[pi].mass = 5e8;
-        planets[pi].velocityX = 0;
-        planets[pi].velocityY = 5;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        pi = count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 800 - cx;
-        planets[pi].y = 0 - cy;
-        planets[pi].mass = 2e14;
-        planets[pi].velocityX = 0;
-        planets[pi].velocityY = -4.5;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        pi = count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = 1200 - cy;
-        planets[pi].mass = 5e8;
-        planets[pi].velocityX = 3.25;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
+        // create some geocentric nonsense
+        createGeocentricSystem(planets, count, cx, cy);
       }
       
       else if( text[0] == 'p' ) {
-        // sol
-        pi =  0; //count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = 0 - cy;
-        planets[pi].mass = 1.9891e30;
-        planets[pi].velocityX = 0;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        // mercury
-        pi = 1; //count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = 57909050e3 - cy;
-        planets[pi].mass = 3.3022e23;
-        planets[pi].velocityX = 47.87e3;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        // venus
-        pi = 2; //count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = -108209184e3 - cx;
-        planets[pi].y = 0 - cy;
-        planets[pi].mass = 4.8685e24;
-        planets[pi].velocityX = 0;
-        planets[pi].velocityY = 35.02e3;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        //earth
-        pi = 3; //count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 149597887e3 - cx;
-        planets[pi].y = 0 - cy;
-        planets[pi].mass = 5.9736e24;
-        planets[pi].velocityX = 0;
-        planets[pi].velocityY = -29.783e3;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        //moon
-        pi = 4; //count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 149597887e3 + 384400e3 - cx; // + 384400e3
-        planets[pi].y = 0 - cy;
-        planets[pi].mass = 7.3477e22;
-        planets[pi].velocityX = 0;
-        planets[pi].velocityY = -29.783e3 - 1.022e3;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        // mars
-        pi = 5; //count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = 227939150e3 - cy;
-        planets[pi].mass = 6.4185e23;
-        planets[pi].velocityX = 24.077e3;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        // jupiter
-        pi = 6; //count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = -778547200e3 - cy;
-        planets[pi].mass = 1.8986e27;
-        planets[pi].velocityX = -13.07e3;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        // saturn
-        pi = 6; //count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = 1433449369.5e3 - cy;
-        planets[pi].mass = 5.6846e26;
-        planets[pi].velocityX = 9.69e3;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
+        // create Sol planetary system
+        createPlanetarySystem(planets, count, cx, cy);
       }
       else if( text[0] == 'm' ) {
-        //earth
-        pi = 3; //count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 0 - cx;
-        planets[pi].y = 0 - cy;
-        planets[pi].mass = 5.9736e24;
-        planets[pi].velocityX = 0;
-        planets[pi].velocityY = 0;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-
-        //satellite in molniya orbit
-        pi = 4; //count * (rand() / (RAND_MAX + 1.0));
-        planets[pi].x = 6929e3 - cx; // + 384400e3
-        planets[pi].y = 0 - cy;
-        planets[pi].mass = 11000;
-        planets[pi].velocityX = 0;
-        planets[pi].velocityY = -10.0125e3;
-        if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-        else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
+        // create molniya orbit
+        createMolniyaOrbit(planets, count, cx, cy);
       }
-    }
+    } // end of keyboard events
 
     // window config events
     if( XCheckMaskEvent(display, StructureNotifyMask, &event) && event.type == ConfigureNotify ) {
@@ -664,7 +358,7 @@ main(int argc, char *argv[]) {
 
       // if clicked on planet then select as centerID for auto centering
       for(pi = 0; pi < count; pi++) {
-        dist = sqrt(pow((cx + planets[pi].x) / zoomFactor + (winw / 2) - event.xbutton.x, 2) + pow((cy + planets[pi].y) / zoomFactor + (winh / 2) - event.xbutton.y, 2));
+        dist = sqrt(pow((cx + planets[pi]->x) / zoomFactor + (winw / 2) - event.xbutton.x, 2) + pow((cy + planets[pi]->y) / zoomFactor + (winh / 2) - event.xbutton.y, 2));
         if( dist < 4 ) {
           centerID = pi;
           continue;
@@ -683,9 +377,9 @@ main(int argc, char *argv[]) {
     // set calculation state on for each planet that has mass
     for(pi = 0; pi < count; pi++)
     {
-      if ( planets[pi].mass > 0 )
+      if ( planets[pi]->mass > 0 )
       {
-        planets[pi].calc = 1;
+        planets[pi]->calc = 1;
       }
     }
     
@@ -695,21 +389,13 @@ main(int argc, char *argv[]) {
     // wait for all threads to end calculations
     pthread_barrier_wait(&calcBarrier);
     
-    // move planets
-    for(pi = 0; pi < count; pi++) {
-      if( planets[pi].mass > 0 ) {
-        // update planet's velocity with new acceleration
-        planets[pi].velocityX += planets[pi].acceleration.accelerationX * timeFactor;
-        planets[pi].velocityY += planets[pi].acceleration.accelerationY * timeFactor;
-
-        // move planet position
-        planets[pi].x += planets[pi].velocityX * timeFactor;
-        planets[pi].y += planets[pi].velocityY * timeFactor;
-      }
-    }
-
+    // move planets after calculations
+    movePlanets(timeFactor, planets, count);
+    
     // calculate collisions
-    calculateCollisions();
+    calculateCollisions(planets, count);
+    massMax = getMassMax(planets, count);
+    massMin = getMassMin(planets, count);
         
     // clear display
     XSetForeground(display, gc, drawColors[COLOR_BACKGROUND].pixel);
@@ -717,8 +403,8 @@ main(int argc, char *argv[]) {
 
     // if following a planet then recenter display on the planet
     if( centerID > -1 ) {
-      cx = -1 * planets[centerID].x;
-      cy = -1 * planets[centerID].y;
+      cx = -1 * planets[centerID]->x;
+      cy = -1 * planets[centerID]->y;
     }
 
     // set radius scale of kg per pixel
@@ -727,17 +413,17 @@ main(int argc, char *argv[]) {
     // draw each planet
     for(pi = 0; pi < count; pi++) {
       // if planet has mass and is within the display area then we draw
-      if( planets[pi].mass > 0 && 
-          (cx + planets[pi].x) / zoomFactor > -1 * (winw / 2) && (cx + planets[pi].x) / zoomFactor < (winw / 2) && 
-          (cy + planets[pi].y) / zoomFactor > -1 * (winh / 2) && (cy + planets[pi].y) / zoomFactor < (winh / 2) ) {
+      if( planets[pi]->mass > 0 && 
+          (cx + planets[pi]->x) / zoomFactor > -1 * (winw / 2) && (cx + planets[pi]->x) / zoomFactor < (winw / 2) && 
+          (cy + planets[pi]->y) / zoomFactor > -1 * (winh / 2) && (cy + planets[pi]->y) / zoomFactor < (winh / 2) ) {
         // calculate radius relative to mass and other planets
-        radius = (int)(planets[pi].mass / radiusScale) + MIN_PIXEL_RADIUS;
+        radius = (int)(planets[pi]->mass / radiusScale) + MIN_PIXEL_RADIUS;
 
         // determine color by flash or radius divisions
-        if( planets[pi].flash ) {
+        if( planets[pi]->flash ) {
             XSetForeground(display, gc, drawColors[COLOR_FLASH].pixel);
-            radius = radius * planets[pi].flash;
-            planets[pi].flash -= 1;
+            radius = radius * planets[pi]->flash;
+            planets[pi]->flash -= 1;
         }
         else if( radius > 16 ) {
           // size is color for a star
@@ -754,15 +440,15 @@ main(int argc, char *argv[]) {
 
         // draw planet dot
         XFillArc(display, pixmap, gc, 
-                 ((cx + planets[pi].x) / zoomFactor + (winw / 2) - radius / 2), 
-                 ((cy + planets[pi].y) / zoomFactor + (winh / 2) - radius / 2), 
+                 ((cx + planets[pi]->x) / zoomFactor + (winw / 2) - radius / 2), 
+                 ((cy + planets[pi]->y) / zoomFactor + (winh / 2) - radius / 2), 
                  radius, radius, 0, 360 * 64);
 
         // draw black border
         XSetForeground(display, gc, drawColors[COLOR_BLACK].pixel);
         XDrawArc(display, pixmap, gc, 
-                 ((cx + planets[pi].x) / zoomFactor + (winw / 2) - radius / 2), 
-                 ((cy + planets[pi].y) / zoomFactor + (winh / 2) - radius / 2), 
+                 ((cx + planets[pi]->x) / zoomFactor + (winw / 2) - radius / 2), 
+                 ((cy + planets[pi]->y) / zoomFactor + (winh / 2) - radius / 2), 
                  radius, radius, 0, 360 * 64);
 
         // show force vectors
@@ -772,17 +458,17 @@ main(int argc, char *argv[]) {
               //draw gravitational force
               XSetForeground(display, gc, drawColors[COLOR_RED].pixel);
               XDrawLine(display, pixmap, gc, 
-                 ((cx + planets[pi].x) / zoomFactor + (winw / 2)),
-                 ((cy + planets[pi].y) / zoomFactor + (winh / 2)),
-                 ((cx + planets[pi].x + (planets[pi].mass * planets[pi].acceleration.accelerationX) * forceMultiplier) / zoomFactor + (winw / 2)),
-                 ((cy + planets[pi].y + (planets[pi].mass * planets[pi].acceleration.accelerationY) * forceMultiplier) / zoomFactor + (winh / 2)));
+                 ((cx + planets[pi]->x) / zoomFactor + (winw / 2)),
+                 ((cy + planets[pi]->y) / zoomFactor + (winh / 2)),
+                 ((cx + planets[pi]->x + (planets[pi]->mass * planets[pi]->acceleration.accelerationX) * forceMultiplier) / zoomFactor + (winw / 2)),
+                 ((cy + planets[pi]->y + (planets[pi]->mass * planets[pi]->acceleration.accelerationY) * forceMultiplier) / zoomFactor + (winh / 2)));
 
               XSetForeground(display, gc, drawColors[COLOR_BLUE].pixel);
               XDrawLine(display, pixmap, gc,
-                 ((cx + planets[pi].x) / zoomFactor + (winw / 2)),
-                 ((cy + planets[pi].y) / zoomFactor + (winh / 2)),
-                 ((cx + planets[pi].x + (planets[pi].mass * planets[pi].velocityX * forceMultiplier / 10)) / zoomFactor + (winw / 2)),
-                 ((cy + planets[pi].y + (planets[pi].mass * planets[pi].velocityY * forceMultiplier / 10)) / zoomFactor + (winh / 2)));
+                 ((cx + planets[pi]->x) / zoomFactor + (winw / 2)),
+                 ((cy + planets[pi]->y) / zoomFactor + (winh / 2)),
+                 ((cx + planets[pi]->x + (planets[pi]->mass * planets[pi]->velocityX * forceMultiplier / 10)) / zoomFactor + (winw / 2)),
+                 ((cy + planets[pi]->y + (planets[pi]->mass * planets[pi]->velocityY * forceMultiplier / 10)) / zoomFactor + (winh / 2)));
 
               break;
 
@@ -790,10 +476,10 @@ main(int argc, char *argv[]) {
              //draw gravitational acceleration
               XSetForeground(display, gc, drawColors[COLOR_WHITE].pixel);
               XDrawLine(display, pixmap, gc,
-                 ((cx + planets[pi].x) / zoomFactor + (winw / 2)),
-                 ((cy + planets[pi].y) / zoomFactor + (winh / 2)),
-                 ((cx + planets[pi].x + (planets[pi].acceleration.accelerationX) * forceMultiplier) / zoomFactor + (winw / 2)),
-                 ((cy + planets[pi].y + (planets[pi].acceleration.accelerationY) * forceMultiplier) / zoomFactor + (winh / 2)));
+                 ((cx + planets[pi]->x) / zoomFactor + (winw / 2)),
+                 ((cy + planets[pi]->y) / zoomFactor + (winh / 2)),
+                 ((cx + planets[pi]->x + (planets[pi]->acceleration.accelerationX) * forceMultiplier) / zoomFactor + (winw / 2)),
+                 ((cy + planets[pi]->y + (planets[pi]->acceleration.accelerationY) * forceMultiplier) / zoomFactor + (winh / 2)));
 
               break;
           }
@@ -812,41 +498,41 @@ main(int argc, char *argv[]) {
 
             // show planet mass
             case 2:
-              sprintf(text, "%2.2E kg", planets[pi].mass);
+              sprintf(text, "%2.2E kg", planets[pi]->mass);
               break;
 
             // show planet velocity
             case 3:
-              fg = sqrt(pow(planets[pi].velocityX, 2) + pow(planets[pi].velocityY, 2));
-              td = atan2(planets[pi].velocityY, planets[pi].velocityX);
-              if( isinf(td) ) td = halfpi; //pival / 2;
-              if( isnan(td) && (planets[pi].velocityX - planets[pi].velocityX) > 0 ) td = 0;
-              if( isnan(td) && (planets[pi].velocityX - planets[pi].velocityX) < 0 ) td = pival;
-              td = td * 180 / pival + 180;
+              fg = sqrt(pow(planets[pi]->velocityX, 2) + pow(planets[pi]->velocityY, 2));
+              td = atan2(planets[pi]->velocityY, planets[pi]->velocityX);
+              if( isinf(td) ) td = M_PI / 2;
+              if( isnan(td) && (planets[pi]->velocityX - planets[pi]->velocityX) > 0 ) td = 0;
+              if( isnan(td) && (planets[pi]->velocityX - planets[pi]->velocityX) < 0 ) td = M_PI;
+              td = td * 180 / M_PI + 180;
               sprintf(text, "%2.2G m/s %3.0f degrees", fg, td);
               break;
 
             // show planet coordinates
             case 4:
-              sprintf(text, "%G, %G", planets[pi].x, planets[pi].y);
+              sprintf(text, "%G, %G", planets[pi]->x, planets[pi]->y);
               break;
 
             // show mass and velocity
             case 5:
-              fg = sqrt(pow(planets[pi].velocityX, 2) + pow(planets[pi].velocityY, 2));
-              td = atan2(planets[pi].velocityY, planets[pi].velocityX);
-              if( isinf(td) ) td = halfpi; //pival / 2;
-              if( isnan(td) && (planets[pi].velocityX - planets[pi].velocityX) > 0 ) td = 0;
-              if( isnan(td) && (planets[pi].velocityX - planets[pi].velocityX) < 0 ) td = pival;
-              td = td * 180 / pival + 180;
+              fg = sqrt(pow(planets[pi]->velocityX, 2) + pow(planets[pi]->velocityY, 2));
+              td = atan2(planets[pi]->velocityY, planets[pi]->velocityX);
+              if( isinf(td) ) td = M_PI / 2;
+              if( isnan(td) && (planets[pi]->velocityX - planets[pi]->velocityX) > 0 ) td = 0;
+              if( isnan(td) && (planets[pi]->velocityX - planets[pi]->velocityX) < 0 ) td = M_PI;
+              td = td * 180 / M_PI + 180;
   //font_info
   //font_height = font_info->max_bounds.ascent +
   //font_info->max_bounds.descent;
 
-              sprintf(text, "%2.2E kg", planets[pi].mass);
+              sprintf(text, "%2.2E kg", planets[pi]->mass);
               XDrawString(display, pixmap, gc, 
-                          (cx + planets[pi].x) / zoomFactor + (winw / 2), 
-                          (cy + planets[pi].y) / zoomFactor + (winh / 2) + 
+                          (cx + planets[pi]->x) / zoomFactor + (winw / 2), 
+                          (cy + planets[pi]->y) / zoomFactor + (winh / 2) + 
                             font_info->max_bounds.ascent +
                             font_info->max_bounds.descent, 
                           text, strlen(text));
@@ -856,35 +542,35 @@ main(int argc, char *argv[]) {
 
             // show inertia and acting gravitational force
             case 6:
-              fg = planets[pi].mass * sqrt(pow(planets[pi].velocityX, 2) + pow(planets[pi].velocityY, 2));
-              td = atan2(planets[pi].velocityY, planets[pi].velocityX);
-              if( isinf(td) ) td = halfpi; //pival / 2;
-              if( isnan(td) && (planets[pi].velocityX - planets[pi].velocityX) > 0 ) td = 0;
-              if( isnan(td) && (planets[pi].velocityX - planets[pi].velocityX) < 0 ) td = pival;
-              td = td * 180 / pival + 180;
+              fg = planets[pi]->mass * sqrt(pow(planets[pi]->velocityX, 2) + pow(planets[pi]->velocityY, 2));
+              td = atan2(planets[pi]->velocityY, planets[pi]->velocityX);
+              if( isinf(td) ) td = M_PI / 2;
+              if( isnan(td) && (planets[pi]->velocityX - planets[pi]->velocityX) > 0 ) td = 0;
+              if( isnan(td) && (planets[pi]->velocityX - planets[pi]->velocityX) < 0 ) td = M_PI;
+              td = td * 180 / M_PI + 180;
 
               sprintf(text, "   P = %2.2G Ns %3.0f degrees", fg, td);
               XDrawString(display, pixmap, gc,
-                          (cx + planets[pi].x) / zoomFactor + (winw / 2),
-                          (cy + planets[pi].y) / zoomFactor + (winh / 2) +
+                          (cx + planets[pi]->x) / zoomFactor + (winw / 2),
+                          (cy + planets[pi]->y) / zoomFactor + (winh / 2) +
                             font_info->max_bounds.ascent +
                             font_info->max_bounds.descent,
                           text, strlen(text));
 
 
-              fg = planets[pi].mass * sqrt(pow(planets[pi].acceleration.accelerationX, 2) + pow(planets[pi].acceleration.accelerationY, 2));
-              td = atan2(planets[pi].acceleration.accelerationY, planets[pi].acceleration.accelerationX);
-              if( isinf(td) ) td = halfpi; //pival / 2;
-              if( isnan(td) && (planets[pi].velocityX - planets[pi].velocityX) > 0 ) td = 0;
-              if( isnan(td) && (planets[pi].velocityX - planets[pi].velocityX) < 0 ) td = pival;
-              td = td * 180 / pival + 180;
+              fg = planets[pi]->mass * sqrt(pow(planets[pi]->acceleration.accelerationX, 2) + pow(planets[pi]->acceleration.accelerationY, 2));
+              td = atan2(planets[pi]->acceleration.accelerationY, planets[pi]->acceleration.accelerationX);
+              if( isinf(td) ) td = M_PI / 2;
+              if( isnan(td) && (planets[pi]->velocityX - planets[pi]->velocityX) > 0 ) td = 0;
+              if( isnan(td) && (planets[pi]->velocityX - planets[pi]->velocityX) < 0 ) td = M_PI;
+              td = td * 180 / M_PI + 180;
               sprintf(text, "   Fg = %2.2G N %3.0f degrees", fg, td);
 
               break;
 
           }
           
-          XDrawString(display, pixmap, gc, (cx + planets[pi].x) / zoomFactor + (winw / 2), (cy + planets[pi].y) / zoomFactor + (winh / 2), text, strlen(text));
+          XDrawString(display, pixmap, gc, (cx + planets[pi]->x) / zoomFactor + (winw / 2), (cy + planets[pi]->y) / zoomFactor + (winh / 2), text, strlen(text));
         }
       }
     }
@@ -903,58 +589,325 @@ main(int argc, char *argv[]) {
 /**
  * Randomize the location, velocity, and mass of all planets.
  */
-void randomizePlanets()
+void randomizePlanets(planet *planetData[], int count)
 {
   int i;
   double r, a;
   
   // seed
   srand((unsigned int)time((time_t *)NULL));
-  massMax = 0;
-  massMin = DBL_MAX;
+//  massMax = 0;
+//  massMin = DBL_MAX;
 
   // loop through all planets
   for(i = 0; i < count; i++) {
     // randomize polar coordinates from center
     r = MAXPOS * (rand() / (RAND_MAX + 1.0));
-    a = twopival * (rand() / (RAND_MAX + 1.0));
+    a = (2 * M_PI) * (rand() / (RAND_MAX + 1.0));
     
     // convert polar coordinates into rectangular
-    planets[i].x = (r * cos(a));
-    if( isnan(planets[i].x) )
+    planetData[i]->x = (r * cos(a));
+    if( isnan(planetData[i]->x) )
     {
-      planets[i].x = 0;
+      planetData[i]->x = 0;
     }
-    else if( isinf(planets[i].x) )
+    else if( isinf(planetData[i]->x) )
     {
-      planets[i].x = r;
+      planetData[i]->x = r;
     }
 
-    planets[i].y = (r * sin(a));
-    if( isnan(planets[i].y) )
+    planetData[i]->y = (r * sin(a));
+    if( isnan(planetData[i]->y) )
     {
-      planets[i].y = 0;
+      planetData[i]->y = 0;
     }
-    else if( isinf(planets[i].y) )
+    else if( isinf(planetData[i]->y) )
     {
-      planets[i].y = r;
+      planetData[i]->y = r;
     }
       
     // random planet velocity
-    planets[i].velocityX = (2 * MAXV * (rand() / (RAND_MAX + 1.0))) - MAXV;
-    planets[i].velocityY = (2 * MAXV * (rand() / (RAND_MAX + 1.0))) - MAXV;
+    planetData[i]->velocityX = (2 * MAXV * (rand() / (RAND_MAX + 1.0))) - MAXV;
+    planetData[i]->velocityY = (2 * MAXV * (rand() / (RAND_MAX + 1.0))) - MAXV;
     
     // random mass
-    planets[i].mass = MAXKG * (pow(1/sqrt(pival), -1 * pow(rand() / (RAND_MAX + 1.0), 2) / 0.75) - 1);
+    planetData[i]->mass = MAXKG * (pow(1/sqrt(M_PI), -1 * pow(rand() / (RAND_MAX + 1.0), 2) / 0.75) - 1);
     
     // reset flash and calculating flags
-    planets[i].flash = 0;
-    planets[i].calc = 0;
-    
-    // keep track of the maximum mass size
-    if( planets[i].mass > massMax ) massMax = planets[i].mass;
-    else if( planets[i].mass < massMin ) massMin = planets[i].mass;
+    planetData[i]->flash = 0;
+    planetData[i]->calc = 0;
   }
+}
+
+
+/**
+ * Clear the planet settings.
+ * 
+ * @param planetData
+ * @param count
+ */
+void clearPlanets(planet *planetData[], int count)
+{
+  int i;
+
+  for(i = 0; i < count; i++) {
+    planetData[i]->x = 0;
+    planetData[i]->y = 0;
+    planetData[i]->velocityX = 0;
+    planetData[i]->velocityY = 0;
+    planetData[i]->mass = 0;
+  }
+}
+
+
+/**
+ * Create a large gravity well.
+ * 
+ * @param planetData
+ * @param count
+ */
+void createGravityWell(planet *planetData[], int count, int cx, int cy)
+{
+  int pi = count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = 0 - cy;
+  planetData[pi]->mass = MAXKG * (int)(1000 * (rand() / (RAND_MAX + 1.0)));
+  planetData[pi]->velocityX = 0;
+  planetData[pi]->velocityY = 0;
+  
+}
+
+
+/**
+ * Create a binary orbiting gravity well.
+ * 
+ * @param planetData
+ * @param count
+ * @param cx
+ * @param cy
+ */
+void createBinaryWell(planet *planetData[], int count, int cx, int cy)
+{
+  int pi;
+  
+  pi = count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = 500 - cy;
+  planetData[pi]->mass = MAXKG * (int)(1000 * (rand() / (RAND_MAX + 1.0)));
+  planetData[pi]->velocityX = 2;
+  planetData[pi]->velocityY = 0;
+
+  pi = count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = -500 - cy;
+  planetData[pi]->mass = MAXKG * (int)(1000 * (rand() / (RAND_MAX + 1.0)));
+  planetData[pi]->velocityX = -2;
+  planetData[pi]->velocityY = 0;
+}
+
+
+/**
+ * Create a heliocentric system.
+ * 
+ * @param planetData
+ * @param count
+ * @param cx
+ * @param cy
+ */
+void createHeliocentricSystem(planet *planetData[], int count, int cx, int cy)
+{
+  int pi;
+
+  pi = count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = 0 - cy;
+  planetData[pi]->mass = 2e14;
+  planetData[pi]->velocityX = 0;
+  planetData[pi]->velocityY = 0;
+
+  pi = count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = -200 - cy;
+  planetData[pi]->mass = 5e8;
+  planetData[pi]->velocityX = -8;
+  planetData[pi]->velocityY = 0;
+
+  pi = count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = -500 - cx;
+  planetData[pi]->y = 0 - cy;
+  planetData[pi]->mass = 5e8;
+  planetData[pi]->velocityX = 0;
+  planetData[pi]->velocityY = 5;
+
+  pi = count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 800 - cx;
+  planetData[pi]->y = 0 - cy;
+  planetData[pi]->mass = 5e8;
+  planetData[pi]->velocityX = 0;
+  planetData[pi]->velocityY = -4.5;
+
+  pi = count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = 1200 - cy;
+  planetData[pi]->mass = 5e8;
+  planetData[pi]->velocityX = 3.8;
+  planetData[pi]->velocityY = 0;
+}
+
+
+/**
+ * Create a geocentric system.
+ * 
+ * @param planetData
+ * @param count
+ * @param cx
+ * @param cy
+ */
+void createGeocentricSystem(planet *planetData[], int count, int cx, int cy)
+{
+  int pi;
+
+  pi = count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = 0 - cy;
+  planetData[pi]->mass = 5e8;
+  planetData[pi]->velocityX = 0;
+  planetData[pi]->velocityY = 0;
+
+  pi = count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = -200 - cy;
+  planetData[pi]->mass = 5e8;
+  planetData[pi]->velocityX = -8;
+  planetData[pi]->velocityY = 0;
+
+  pi = count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = -500 - cx;
+  planetData[pi]->y = 0 - cy;
+  planetData[pi]->mass = 5e8;
+  planetData[pi]->velocityX = 0;
+  planetData[pi]->velocityY = 5;
+
+  pi = count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 800 - cx;
+  planetData[pi]->y = 0 - cy;
+  planetData[pi]->mass = 2e14;
+  planetData[pi]->velocityX = 0;
+  planetData[pi]->velocityY = -4.5;
+
+  pi = count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = 1200 - cy;
+  planetData[pi]->mass = 5e8;
+  planetData[pi]->velocityX = 3.25;
+  planetData[pi]->velocityY = 0;
+}
+
+
+/**
+ * Create Sol planetary system out to Saturn.
+ * 
+ * @param planetData
+ * @param count
+ * @param cx
+ * @param cy
+ */
+void createPlanetarySystem(planet *planetData[], int count, int cx, int cy)
+{
+  int pi;
+
+  // sol
+  pi =  0; //count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = 0 - cy;
+  planetData[pi]->mass = 1.9891e30;
+  planetData[pi]->velocityX = 0;
+  planetData[pi]->velocityY = 0;
+
+  // mercury
+  pi = 1; //count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = 57909050e3 - cy;
+  planetData[pi]->mass = 3.3022e23;
+  planetData[pi]->velocityX = 47.87e3;
+  planetData[pi]->velocityY = 0;
+
+  // venus
+  pi = 2; //count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = -108209184e3 - cx;
+  planetData[pi]->y = 0 - cy;
+  planetData[pi]->mass = 4.8685e24;
+  planetData[pi]->velocityX = 0;
+  planetData[pi]->velocityY = 35.02e3;
+
+  //earth
+  pi = 3; //count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 149597887e3 - cx;
+  planetData[pi]->y = 0 - cy;
+  planetData[pi]->mass = 5.9736e24;
+  planetData[pi]->velocityX = 0;
+  planetData[pi]->velocityY = -29.783e3;
+
+  //moon
+  pi = 4; //count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 149597887e3 + 384400e3 - cx; // + 384400e3
+  planetData[pi]->y = 0 - cy;
+  planetData[pi]->mass = 7.3477e22;
+  planetData[pi]->velocityX = 0;
+  planetData[pi]->velocityY = -29.783e3 - 1.022e3;
+
+  // mars
+  pi = 5; //count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = 227939150e3 - cy;
+  planetData[pi]->mass = 6.4185e23;
+  planetData[pi]->velocityX = 24.077e3;
+  planetData[pi]->velocityY = 0;
+
+  // jupiter
+  pi = 6; //count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = -778547200e3 - cy;
+  planetData[pi]->mass = 1.8986e27;
+  planetData[pi]->velocityX = -13.07e3;
+  planetData[pi]->velocityY = 0;
+
+  // saturn
+  pi = 7; //count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = 1433449369.5e3 - cy;
+  planetData[pi]->mass = 5.6846e26;
+  planetData[pi]->velocityX = 9.69e3;
+  planetData[pi]->velocityY = 0;
+}
+
+
+/**
+ * Create molniya orbit around earth.
+ * 
+ * @param planetData
+ * @param count
+ * @param cx
+ * @param cy
+ */
+void createMolniyaOrbit(planet *planetData[], int count, int cx, int cy)
+{
+  int pi;
+
+  pi = 3; //count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 0 - cx;
+  planetData[pi]->y = 0 - cy;
+  planetData[pi]->mass = 5.9736e24;
+  planetData[pi]->velocityX = 0;
+  planetData[pi]->velocityY = 0;
+
+  //satellite in molniya orbit
+  pi = 4; //count * (rand() / (RAND_MAX + 1.0));
+  planetData[pi]->x = 6929e3 - cx; // + 384400e3
+  planetData[pi]->y = 0 - cy;
+  planetData[pi]->mass = 11000;
+  planetData[pi]->velocityX = 0;
+  planetData[pi]->velocityY = -10.0125e3;
 }
 
 
@@ -965,9 +918,9 @@ void randomizePlanets()
  * @param p2
  * @return 
  */
-void calculateDistance(int p1, int p2)
+void calculateDistance(int p1, int p2, planet *planetData[])
 {
-  planets[p1].calcDistance = sqrt(pow(planets[p1].x - planets[p2].x, 2) + pow(planets[p1].y - planets[p2].y, 2));
+  planetData[p1]->calcDistance = sqrt(pow(planetData[p1]->x - planetData[p2]->x, 2) + pow(planetData[p1]->y - planetData[p2]->y, 2));
 }
 
 
@@ -978,16 +931,16 @@ void calculateDistance(int p1, int p2)
  * @param p2
  * @return 
  */
-void calculateGravitationalAcceleration(int p1, int p2)
+void calculateGravitationalAcceleration(int p1, int p2, planet *planetData[])
 {
-  calculateDistance(p1, p2);
+  calculateDistance(p1, p2, planetData);
   
-  if ( planets[p1].calcDistance < planets[p1].nearestDistance )
+  if ( planetData[p1]->calcDistance < planetData[p1]->nearestDistance )
   {
-    planets[p1].nearestDistance = planets[p1].calcDistance;
+    planetData[p1]->nearestDistance = planetData[p1]->calcDistance;
   }
   
-  planets[p1].calcGravity = G * (planets[p1].mass * planets[p2].mass / pow(planets[p1].calcDistance, 2));
+  planetData[p1]->calcGravity = G * (planetData[p1]->mass * planetData[p2]->mass / pow(planetData[p1]->calcDistance, 2));
 }
 
 
@@ -998,20 +951,20 @@ void calculateGravitationalAcceleration(int p1, int p2)
  * @param p2
  * @return 
  */
-void calculateGravitationalDirection(int p1, int p2)
+void calculateGravitationalDirection(int p1, int p2, planet *planetData[])
 {
-  planets[p1].calcDirection = atan2(planets[p2].y - planets[p1].y, planets[p2].x - planets[p1].x);
-  if( isinf(planets[p1].calcDirection) )
+  planetData[p1]->calcDirection = atan2(planetData[p2]->y - planetData[p1]->y, planetData[p2]->x - planetData[p1]->x);
+  if( isinf(planetData[p1]->calcDirection) )
   {
-    planets[p1].calcDirection = pival / 2;
+    planetData[p1]->calcDirection = M_PI / 2;
   }
-  else if( isnan(planets[p1].calcDirection) && (planets[p2].x - planets[p1].x) > 0 )
+  else if( isnan(planetData[p1]->calcDirection) && (planetData[p2]->x - planetData[p1]->x) > 0 )
   {
-    planets[p1].calcDirection = 0;
+    planetData[p1]->calcDirection = 0;
   }
-  else if( isnan(planets[p1].calcDirection) && (planets[p2].x - planets[p1].x) < 0 )
+  else if( isnan(planetData[p1]->calcDirection) && (planetData[p2]->x - planetData[p1]->x) < 0 )
   {
-    planets[p1].calcDirection = pival;
+    planetData[p1]->calcDirection = M_PI;
   }
 }
 
@@ -1022,34 +975,96 @@ void calculateGravitationalDirection(int p1, int p2)
  * @param p1
  * @param p2
  */
-void addGravitationalAcceleration(int p1, int p2)
+void addGravitationalAcceleration(int p1, int p2, planet *planetData[])
 {
   // calculate the polar acceleration between two planets
-  calculateGravitationalAcceleration(p1, p2);
-  calculateGravitationalDirection(p1, p2);
+  calculateGravitationalAcceleration(p1, p2, planetData);
+  calculateGravitationalDirection(p1, p2, planetData);
   
-  planets[p1].calcAccelerationX = (planets[p1].calcGravity / planets[p1].mass) * cos(planets[p1].calcDirection);
-  if( isnan(planets[p1].calcAccelerationX) )
+  planetData[p1]->calcAccelerationX = (planetData[p1]->calcGravity / planetData[p1]->mass) * cos(planetData[p1]->calcDirection);
+  if( isnan(planetData[p1]->calcAccelerationX) )
   {
-    planets[p1].calcAccelerationX = 0;
+    planetData[p1]->calcAccelerationX = 0;
   }
-  else if( isinf(planets[p1].calcAccelerationX) )
+  else if( isinf(planetData[p1]->calcAccelerationX) )
   {
-    planets[p1].calcAccelerationX = planets[p1].calcGravity / planets[p1].mass;
-  }
-  
-  planets[p1].calcAccelerationY = (planets[p1].calcGravity / planets[p1].mass) * sin(planets[p1].calcDirection);
-  if( isnan(planets[p1].calcAccelerationY) )
-  {
-    planets[p1].calcAccelerationY = 0;
-  }
-  else if( isinf(planets[p1].calcAccelerationY) )
-  {
-    planets[p1].calcAccelerationY = planets[p1].calcGravity / planets[p1].mass;
+    planetData[p1]->calcAccelerationX = planetData[p1]->calcGravity / planetData[p1]->mass;
   }
   
-  planets[p1].acceleration.accelerationX += planets[p1].calcAccelerationX;
-  planets[p1].acceleration.accelerationY += planets[p1].calcAccelerationY;
+  planetData[p1]->calcAccelerationY = (planetData[p1]->calcGravity / planetData[p1]->mass) * sin(planetData[p1]->calcDirection);
+  if( isnan(planetData[p1]->calcAccelerationY) )
+  {
+    planetData[p1]->calcAccelerationY = 0;
+  }
+  else if( isinf(planetData[p1]->calcAccelerationY) )
+  {
+    planetData[p1]->calcAccelerationY = planetData[p1]->calcGravity / planetData[p1]->mass;
+  }
+  
+  planetData[p1]->acceleration.accelerationX += planetData[p1]->calcAccelerationX;
+  planetData[p1]->acceleration.accelerationY += planetData[p1]->calcAccelerationY;
+}
+
+
+/**
+ * Adjust planet velocity and move based on time factor.
+ */
+void movePlanets(double timeFactor, planet *planetData[], int count)
+{
+  int pi;
+  
+  // move planets
+  for(pi = 0; pi < count; pi++) {
+    if( planetData[pi]->mass > 0 ) {
+      // update planet's velocity with new acceleration
+      planetData[pi]->velocityX += planetData[pi]->acceleration.accelerationX * timeFactor;
+      planetData[pi]->velocityY += planetData[pi]->acceleration.accelerationY * timeFactor;
+
+      // move planet position
+      planetData[pi]->x += planetData[pi]->velocityX * timeFactor;
+      planetData[pi]->y += planetData[pi]->velocityY * timeFactor;
+    }
+  }
+}
+
+
+/**
+ * Calculate collisions between planets.
+ */
+void calculateCollisions(planet *planetData[], int count)
+{
+  int pi, vi;
+  double dist, massMax;
+  
+  massMax = getMassMax(planetData, count);
+  
+  // calculate collisions
+  for(pi = 0; pi < count; pi++) {
+    // only need to process if this planet not consumed and worst case planet came too close
+    if ( planetData[pi]->mass > 0 && inCollisionRange(planetData[pi]->mass, massMax, planetData[pi]->nearestDistance) )
+    {
+       // check all planets to find collisions
+      for(vi = 0; vi < count; vi++) {
+        // not self, other planet has mass, and other planet mass is less than or equal
+        if ( vi != pi && planetData[vi]->mass > 0 && planetData[vi]->mass <= planetData[pi]->mass )
+        {
+          calculateDistance(pi, vi, planetData);
+          dist = planetData[pi]->calcDistance;
+
+          // simple collision
+          if( inCollisionRange(planetData[pi]->mass, planetData[vi]->mass, dist) ) {
+            // collision
+            planetData[pi]->velocityX = (planetData[pi]->velocityX * planetData[pi]->mass + planetData[vi]->velocityX * planetData[vi]->mass) / (planetData[pi]->mass + planetData[vi]->mass);
+            planetData[pi]->velocityY = (planetData[pi]->velocityY * planetData[pi]->mass + planetData[vi]->velocityY * planetData[vi]->mass) / (planetData[pi]->mass + planetData[vi]->mass);
+            planetData[pi]->mass += planetData[vi]->mass;
+            
+            planetData[vi]->mass = 0;
+            planetData[pi]->flash = 10;
+          }
+        }
+      }
+    }
+  }
 }
 
 
@@ -1063,6 +1078,9 @@ void addGravitationalAcceleration(int p1, int p2)
  */
 int inCollisionRange(double mass1, double mass2, double distance)
 {
+  double sphereradc; // calculated constant for sphere radius formula
+  sphereradc = (4 / 3 * M_PI) * 5000000000; // multiplied by constant for dirty density calc
+
   if ( cbrt(mass1 / sphereradc) + cbrt(mass2 / sphereradc) >= distance )
   {
     // collision
@@ -1073,39 +1091,45 @@ int inCollisionRange(double mass1, double mass2, double distance)
 }
 
 
-void calculateCollisions()
+/**
+ * Get the mass maximum in the group of planets.
+ * 
+ * @param planetData
+ * @param count
+ * @return 
+ */
+double getMassMax(planet *planetData[], int count)
 {
-  int pi, vi;
-  double dist;
+  int pi;
+  double massMax = 0;
   
-  // calculate collisions
+  // find mass max
   for(pi = 0; pi < count; pi++) {
-    // only need to process if this planet not consumed and worst case planet came too close
-    if ( planets[pi].mass > 0 && inCollisionRange(planets[pi].mass, massMax, planets[pi].nearestDistance) )
-    {
-       // check all planets to find collisions
-      for(vi = 0; vi < count; vi++) {
-        // not self, other planet has mass, and other planet mass is less than or equal
-        if ( vi != pi && planets[vi].mass > 0 && planets[vi].mass <= planets[pi].mass )
-        {
-          calculateDistance(pi, vi);
-          dist = planets[pi].calcDistance;
-
-          // simple collision
-          if( inCollisionRange(planets[pi].mass, planets[vi].mass, dist) ) {
-            // collision
-            planets[pi].velocityX = (planets[pi].velocityX * planets[pi].mass + planets[vi].velocityX * planets[vi].mass) / (planets[pi].mass + planets[vi].mass);
-            planets[pi].velocityY = (planets[pi].velocityY * planets[pi].mass + planets[vi].velocityY * planets[vi].mass) / (planets[pi].mass + planets[vi].mass);
-            planets[pi].mass += planets[vi].mass;
-            if( planets[pi].mass > massMax ) massMax = planets[pi].mass;
-            else if( planets[pi].mass < massMin ) massMin = planets[pi].mass;
-            planets[vi].mass = 0;
-            planets[pi].flash = 10;
-          }
-        }
-      }
-    }
+    if( planetData[pi]->mass > massMax ) massMax = planetData[pi]->mass;
   }
+  
+  return massMax;
+}
+
+
+/**
+ * Get the mass minimum in the group of planets.
+ * 
+ * @param planetData
+ * @param count
+ * @return 
+ */
+double getMassMin(planet *planetData[], int count)
+{
+  int pi;
+  double massMin = DBL_MAX;
+  
+  // find mass max
+  for(pi = 0; pi < count; pi++) {
+    if( planetData[pi]->mass < massMin ) massMin = planetData[pi]->mass;
+  }
+  
+  return massMin;
 }
 
 
@@ -1114,71 +1138,76 @@ void calculateCollisions()
  * 
  * performs gravitational calculations in a multi-thread safe environment
  * 
- * @param args
+ * @param args A pointer to arguments, in this case a calcArgs struct.
  * @return 
  */
 void * calcWorker(void * args)
 {
+  calcArgs *threadArgs;
+  planet **planetData;  
   int p, i;
+  
+  threadArgs = (calcArgs *) args;
+  planetData = (*threadArgs).planetData;
   
   while (1)
   {
     p = 0;
     
     // wait for for all calculation ready
-    pthread_barrier_wait(&calcBarrier);
+    pthread_barrier_wait((*threadArgs).calcBarrier);
   
-    while (p < count)
+    while (p < (*threadArgs).count)
     {
-      p = getNextCalcIndex(p);
+      p = getNextCalcIndex(p, threadArgs);
       
-      if ( p < count )
+      if ( p < (*threadArgs).count )
       {
-        // reset gravity values for this planet
-        planets[p].acceleration.accelerationX = 0;
-        planets[p].acceleration.accelerationY = 0;
-        planets[p].nearestDistance = DBL_MAX;
+        // reset gravity values for our planet
+        planetData[p]->acceleration.accelerationX = 0;
+        planetData[p]->acceleration.accelerationY = 0;
+        planetData[p]->nearestDistance = DBL_MAX;
         
-        // calculate between individual planets
-        for(i = 0; i < count; i++) {
-          if( i != p && planets[i].mass > 0 ) {
-            addGravitationalAcceleration(p, i);
+        // calculate acceleration between individual planets and our planet
+        for(i = 0; i < (*threadArgs).count; i++) {
+          if( i != p && planetData[i]->mass > 0 ) {
+            addGravitationalAcceleration(p, i, planetData);
           }
         }
       }
     } // planet gravitational calculation loop
     
-    // wait for for all calculation finished
-    pthread_barrier_wait(&calcBarrier);
+    // wait for for all calculations finished
+    pthread_barrier_wait((*threadArgs).calcBarrier);
     
   } // main loop
-  
 }
 
 
 /**
  * thread safe method to lock a specific planet index for calculations
  * 
- * @param p
+ * @param p The starting index to use for the look up.
+ * @param planetData Pointer to the planet data array.
  * @return 
  */
-int getNextCalcIndex(int p)
+int getNextCalcIndex(int p, calcArgs *calcThreadArgs)
 {
   int i;
   
-  pthread_mutex_lock(&calcMutex);
+  pthread_mutex_lock((*calcThreadArgs).calcMutex);
   
-  for(i = p; i < count; i++)
+  for(i = p; i < (*calcThreadArgs).count; i++)
   {
-    if ( planets[i].calc )
+    if ( (*calcThreadArgs).planetData[i]->calc )
     {
-      planets[i].calc = 0;
-      pthread_mutex_unlock(&calcMutex);
+      (*calcThreadArgs).planetData[i]->calc = 0;
+      pthread_mutex_unlock((*calcThreadArgs).calcMutex);
       return i;
     }
   }
     
-  pthread_mutex_unlock(&calcMutex);
+  pthread_mutex_unlock((*calcThreadArgs).calcMutex);
   
   return i;
 }
