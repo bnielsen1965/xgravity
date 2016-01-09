@@ -31,7 +31,7 @@ For more information, please refer to <http://unlicense.org/>
  */
 
 #include <X11/Xlib.h> // Every Xlib program must include this
-//#include <assert.h>   // I include this to test return values the lazy way
+#include <X11/Xutil.h>
 #include <unistd.h>   // So we got the profile for 10 seconds
 #include <stdio.h>
 #include <stdlib.h>
